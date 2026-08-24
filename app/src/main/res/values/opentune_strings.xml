@@ -581,4 +581,11 @@
     <string name="discord_sign_in_method_legacy_warning">Uses your Discord account token directly — against Discord\'s ToS and carries a ban risk. Prefer Official above unless you need it.</string>
     <string name="discord_section_content">Content</string>
     <string name="discord_section_buttons">Buttons</string>
+
+    <string name="show_canvas_debug">Show Canvas debug</string>
+    <string name="description_show_canvas_debug">Show logs and statistics for the Canvas Artwork system</string>
+    <string name="canvas_debug_section">Canvas Artwork</string>
+    <string name="canvas_cache_stats">Canvas cache</string>
+    <string name="canvas_logs">Canvas logs</string>
+    <string name="refresh_catalog">Reload catalog</string>
 </resources>

@@ -6,10 +6,9 @@
 
 
 
-package com.arturo254.opentune.utils
+package com.arturo254.opentune.canvas.providers
 
-import com.arturo254.opentune.canvas.providers.GlobalLog
-import com.arturo254.opentune.canvas.providers.LogEntry
+import android.util.Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import timber.log.Timber
@@ -38,11 +37,11 @@ object GlobalLog {
     fun format(entry: LogEntry): String {
         val ts = timeFormat.format(Date(entry.time))
         val lvl = when (entry.level) {
-            android.util.Log.VERBOSE -> "V"
-            android.util.Log.DEBUG -> "D"
-            android.util.Log.INFO -> "I"
-            android.util.Log.WARN -> "W"
-            android.util.Log.ERROR -> "E"
+            Log.VERBOSE -> "V"
+            Log.DEBUG -> "D"
+            Log.INFO -> "I"
+            Log.WARN -> "W"
+            Log.ERROR -> "E"
             else -> "?"
         }
         val tag = entry.tag ?: ""
