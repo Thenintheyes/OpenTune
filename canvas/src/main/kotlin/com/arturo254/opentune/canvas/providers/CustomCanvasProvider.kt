@@ -1,6 +1,7 @@
 package com.arturo254.opentune.canvas.providers
 
 import android.content.Context
+import android.util.Log
 import com.arturo254.opentune.canvas.CanvasCacheManager
 import com.arturo254.opentune.canvas.models.CanvasArtwork
 import io.ktor.client.HttpClient
@@ -73,10 +74,15 @@ object CustomCanvasProvider {
     private var appContext: Context? = null
     private const val CATALOG_FILE = "canvas_catalog.json"
 
+    // ===================== INICIALIZACIÓN =====================
+
     fun init(context: Context) {
         appContext = context.applicationContext
         loadCatalogFromDisk()
+        GlobalLog.append(Log.INFO, "CustomCanvas", "🎵 CustomCanvasProvider inicializado")
     }
+
+    // ===================== MÉTODOS PÚBLICOS =====================
 
     suspend fun getBySongArtist(
         song: String? = null,
@@ -85,11 +91,15 @@ object CustomCanvasProvider {
     ): CanvasArtwork? {
         val key = cacheKey(artist, album, song)
         cache[key]?.takeIf { it.expiresAtMs > System.currentTimeMillis() }?.let {
-            Timber.d("🎵 CustomCanvas - Cache hit")
+            val msg = "🎵 CustomCanvas - Cache hit (memoria)"
+            Timber.d(msg)
+            GlobalLog.append(Log.DEBUG, "CustomCanvas", msg)
             return it.value
         }
 
-        Timber.d("🎵 CustomCanvas - Buscando: artist=$artist, album=$album, song=$song")
+        val msg = "🎵 CustomCanvas - Buscando: artist=$artist, album=$album, song=$song"
+        Timber.d(msg)
+        GlobalLog.append(Log.DEBUG, "CustomCanvas", msg)
 
         val result = searchCanvas(artist, album, song)
         cache[key] = CacheEntry(result, System.currentTimeMillis() + CACHE_TTL_MS)
@@ -106,6 +116,32 @@ object CustomCanvasProvider {
             album = album
         )
     }
+
+    // ===================== MÉTODOS DE DEPURACIÓN =====================
+
+    fun isCatalogLoaded(): Boolean {
+        synchronized(listCacheLock) {
+            return listCache != null && listCache?.entries?.isNotEmpty() == true
+        }
+    }
+
+    suspend fun forceRefreshCatalog() {
+        val msg = "🎵 CustomCanvas - Forzando recarga de catálogo..."
+        Timber.d(msg)
+        GlobalLog.append(Log.INFO, "CustomCanvas", msg)
+
+        synchronized(listCacheLock) {
+            listCache = null
+        }
+        // Forzar descarga
+        getCatalog()
+
+        val msg2 = "🎵 CustomCanvas - Catálogo recargado"
+        Timber.d(msg2)
+        GlobalLog.append(Log.INFO, "CustomCanvas", msg2)
+    }
+
+    // ===================== MÉTODOS PRIVADOS =====================
 
     private suspend fun searchCanvas(
         artist: String,
@@ -124,7 +160,9 @@ object CustomCanvasProvider {
         }
 
         if (candidates.isEmpty()) {
-            Timber.d("🎵 CustomCanvas - Sin coincidencias de artista")
+            val msg = "🎵 CustomCanvas - Sin coincidencias de artista"
+            Timber.d(msg)
+            GlobalLog.append(Log.WARN, "CustomCanvas", msg)
             return null
         }
 
@@ -148,7 +186,9 @@ object CustomCanvasProvider {
         }
 
         if (albumCandidates.isEmpty()) {
-            Timber.d("🎵 CustomCanvas - Sin coincidencias de álbum")
+            val msg = "🎵 CustomCanvas - Sin coincidencias de álbum"
+            Timber.d(msg)
+            GlobalLog.append(Log.WARN, "CustomCanvas", msg)
             return null
         }
 
@@ -180,7 +220,9 @@ object CustomCanvasProvider {
 
         val cached = CanvasCacheManager.getCachedCanvas(cacheKey)
         if (cached != null) {
-            Timber.d("🎵 CustomCanvas - ✅ Cache hit (disco): ${cached.url}")
+            val msg = "🎵 CustomCanvas - ✅ Cache hit (disco): ${cached.url}"
+            Timber.d(msg)
+            GlobalLog.append(Log.INFO, "CustomCanvas", msg)
             return CanvasArtwork(
                 name = entry.song.takeIf { it.isNotBlank() },
                 artist = entry.artist,
@@ -190,7 +232,9 @@ object CustomCanvasProvider {
             )
         }
 
-        Timber.d("🎵 CustomCanvas - ✅ Encontrado por $matchType: ${entry.url} (artista=${entry.artist}, album=${entry.album})")
+        val msg = "🎵 CustomCanvas - ✅ Encontrado por $matchType: ${entry.url} (artista=${entry.artist}, album=${entry.album})"
+        Timber.d(msg)
+        GlobalLog.append(Log.INFO, "CustomCanvas", msg)
 
         val videoData = downloadVideo(entry.url)
         if (videoData != null) {
@@ -202,9 +246,13 @@ object CustomCanvasProvider {
                 url = entry.url,
                 videoData = videoData
             )
-            Timber.d("🎵 CustomCanvas - ✅ Video cacheado: ${entry.url}")
+            val msg2 = "🎵 CustomCanvas - ✅ Video cacheado: ${entry.url}"
+            Timber.d(msg2)
+            GlobalLog.append(Log.INFO, "CustomCanvas", msg2)
         } else {
-            Timber.d("🎵 CustomCanvas - ⚠️ No se pudo descargar/cachear video: ${entry.url}")
+            val msg2 = "🎵 CustomCanvas - ⚠️ No se pudo descargar/cachear video: ${entry.url}"
+            Timber.d(msg2)
+            GlobalLog.append(Log.WARN, "CustomCanvas", msg2)
         }
 
         return CanvasArtwork(
@@ -218,12 +266,17 @@ object CustomCanvasProvider {
 
     private suspend fun downloadVideo(url: String): ByteArray? {
         return runCatching {
-            Timber.d("🎵 CustomCanvas - Descargando video: $url")
+            val msg = "🎵 CustomCanvas - Descargando video: $url"
+            Timber.d(msg)
+            GlobalLog.append(Log.DEBUG, "CustomCanvas", msg)
+
             val response = client.get(url)
             if (response.status == HttpStatusCode.OK) {
                 response.bodyAsBytes()
             } else {
-                Timber.d("🎵 CustomCanvas - Error descargando video: ${response.status}")
+                val msg2 = "🎵 CustomCanvas - Error descargando video: ${response.status}"
+                Timber.d(msg2)
+                GlobalLog.append(Log.ERROR, "CustomCanvas", msg2)
                 null
             }
         }.getOrNull()
@@ -232,21 +285,28 @@ object CustomCanvasProvider {
     private suspend fun getCatalog(): List<CanvasEntry>? {
         synchronized(listCacheLock) {
             listCache?.takeIf { it.expiresAtMs > System.currentTimeMillis() }?.let {
-                Timber.d("🎵 CustomCanvas - Catálogo en caché de memoria (${it.entries.size} entradas)")
+                val msg = "🎵 CustomCanvas - Catálogo en caché de memoria (${it.entries.size} entradas)"
+                Timber.d(msg)
+                GlobalLog.append(Log.DEBUG, "CustomCanvas", msg)
                 return it.entries
             }
         }
 
         val diskEntries = loadCatalogFromDisk()
         if (diskEntries != null) {
-            Timber.d("🎵 CustomCanvas - Catálogo cargado desde disco (${diskEntries.size} entradas)")
+            val msg = "🎵 CustomCanvas - Catálogo cargado desde disco (${diskEntries.size} entradas)"
+            Timber.d(msg)
+            GlobalLog.append(Log.INFO, "CustomCanvas", msg)
             synchronized(listCacheLock) {
                 listCache = ListCacheEntry(diskEntries, System.currentTimeMillis() + LIST_CACHE_TTL_MS)
             }
             return diskEntries
         }
 
-        Timber.d("🎵 CustomCanvas - Descargando catálogo desde Cloudflare Workers...")
+        val msg = "🎵 CustomCanvas - Descargando catálogo desde Cloudflare Workers..."
+        Timber.d(msg)
+        GlobalLog.append(Log.INFO, "CustomCanvas", msg)
+
         val fetched = fetchCatalogFromNetwork()
 
         if (fetched != null) {
@@ -254,9 +314,13 @@ object CustomCanvasProvider {
             synchronized(listCacheLock) {
                 listCache = ListCacheEntry(fetched, System.currentTimeMillis() + LIST_CACHE_TTL_MS)
             }
-            Timber.d("🎵 CustomCanvas - Catálogo descargado (${fetched.size} entradas)")
+            val msg2 = "🎵 CustomCanvas - Catálogo descargado (${fetched.size} entradas)"
+            Timber.d(msg2)
+            GlobalLog.append(Log.INFO, "CustomCanvas", msg2)
         } else {
-            Timber.d("🎵 CustomCanvas - No se pudo descargar el catálogo")
+            val msg2 = "🎵 CustomCanvas - No se pudo descargar el catálogo"
+            Timber.d(msg2)
+            GlobalLog.append(Log.ERROR, "CustomCanvas", msg2)
         }
 
         return fetched
@@ -269,7 +333,9 @@ object CustomCanvasProvider {
             }
 
             if (response.status != HttpStatusCode.OK) {
-                Timber.d("🎵 CustomCanvas - Error HTTP: ${response.status}")
+                val msg = "🎵 CustomCanvas - Error HTTP: ${response.status}"
+                Timber.d(msg)
+                GlobalLog.append(Log.ERROR, "CustomCanvas", msg)
                 return null
             }
 
@@ -277,7 +343,9 @@ object CustomCanvasProvider {
             val trimmed = rawBody.trimStart()
 
             if (!trimmed.startsWith("{") && !trimmed.startsWith("[")) {
-                Timber.d("🎵 CustomCanvas - ⚠️ Respuesta no es JSON. Primeros 200 chars: ${rawBody.take(200)}")
+                val msg = "🎵 CustomCanvas - ⚠️ Respuesta no es JSON. Primeros 200 chars: ${rawBody.take(200)}"
+                Timber.d(msg)
+                GlobalLog.append(Log.ERROR, "CustomCanvas", msg)
                 return null
             }
 
@@ -285,7 +353,9 @@ object CustomCanvasProvider {
             val success = root["success"]?.jsonPrimitive?.contentOrNull?.toBoolean() ?: false
 
             if (!success) {
-                Timber.d("🎵 CustomCanvas - success=false en la respuesta")
+                val msg = "🎵 CustomCanvas - success=false en la respuesta"
+                Timber.d(msg)
+                GlobalLog.append(Log.ERROR, "CustomCanvas", msg)
                 return null
             }
 
@@ -293,7 +363,9 @@ object CustomCanvasProvider {
             val canvasesArray = dataWrapper?.get("canvases")?.jsonArray
 
             if (canvasesArray == null) {
-                Timber.d("🎵 CustomCanvas - ⚠️ No existe 'data.canvases'. Keys: ${dataWrapper?.keys}")
+                val msg = "🎵 CustomCanvas - ⚠️ No existe 'data.canvases'. Keys: ${dataWrapper?.keys}"
+                Timber.d(msg)
+                GlobalLog.append(Log.ERROR, "CustomCanvas", msg)
                 return null
             }
 
@@ -302,7 +374,9 @@ object CustomCanvasProvider {
                 val url = obj["url"]?.jsonPrimitive?.contentOrNull
                 val entryArtist = obj["artist"]?.jsonPrimitive?.contentOrNull
                 if (url == null || entryArtist == null) {
-                    Timber.d("🎵 CustomCanvas - ⚠️ Entrada sin url/artist descartada: $obj")
+                    val msg = "🎵 CustomCanvas - ⚠️ Entrada sin url/artist descartada: $obj"
+                    Timber.d(msg)
+                    GlobalLog.append(Log.WARN, "CustomCanvas", msg)
                     null
                 } else {
                     CanvasEntry(
@@ -314,7 +388,9 @@ object CustomCanvasProvider {
                 }
             }
         } catch (e: Exception) {
-            Timber.e(e, "🎵 CustomCanvas - Excepción consultando catálogo")
+            val msg = "🎵 CustomCanvas - Excepción consultando catálogo: ${e.message}"
+            Timber.e(e, msg)
+            GlobalLog.append(Log.ERROR, "CustomCanvas", msg)
             null
         }
     }
@@ -325,9 +401,13 @@ object CustomCanvasProvider {
             val file = File(context.filesDir, CATALOG_FILE)
             val jsonString = jsonParser.encodeToString(entries)
             file.writeText(jsonString)
-            Timber.d("🎵 CustomCanvas - Catálogo guardado en disco (${entries.size} entradas)")
+            val msg = "🎵 CustomCanvas - Catálogo guardado en disco (${entries.size} entradas)"
+            Timber.d(msg)
+            GlobalLog.append(Log.DEBUG, "CustomCanvas", msg)
         } catch (e: Exception) {
-            Timber.e(e, "🎵 CustomCanvas - Error guardando catálogo en disco")
+            val msg = "🎵 CustomCanvas - Error guardando catálogo en disco: ${e.message}"
+            Timber.e(e, msg)
+            GlobalLog.append(Log.ERROR, "CustomCanvas", msg)
         }
     }
 
@@ -339,10 +419,14 @@ object CustomCanvasProvider {
 
             val jsonString = file.readText()
             val entries = jsonParser.decodeFromString<List<CanvasEntry>>(jsonString)
-            Timber.d("🎵 CustomCanvas - Catálogo cargado desde disco (${entries.size} entradas)")
+            val msg = "🎵 CustomCanvas - Catálogo cargado desde disco (${entries.size} entradas)"
+            Timber.d(msg)
+            GlobalLog.append(Log.DEBUG, "CustomCanvas", msg)
             return entries
         } catch (e: Exception) {
-            Timber.e(e, "🎵 CustomCanvas - Error cargando catálogo desde disco")
+            val msg = "🎵 CustomCanvas - Error cargando catálogo desde disco: ${e.message}"
+            Timber.e(e, msg)
+            GlobalLog.append(Log.ERROR, "CustomCanvas", msg)
             return null
         }
     }
