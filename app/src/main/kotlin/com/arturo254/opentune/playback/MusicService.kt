@@ -4460,7 +4460,7 @@ class MusicService :
                 try {
                     val alternativeUrl = runCatching {
                         runBlocking(Dispatchers.IO) {
-                            withTimeout(5000L) { // Timeout de 5 segundos
+                            withTimeout(20000L) { // Timeout de 20 segundos
                                 JossRedClient.getStreamingUrl(mediaId)
                             }
                         }
