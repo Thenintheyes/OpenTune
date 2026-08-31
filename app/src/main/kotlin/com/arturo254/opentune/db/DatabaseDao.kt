@@ -480,6 +480,16 @@ interface DatabaseDao {
         toTimeStamp: Long? = LocalDateTime.now().toInstant(ZoneOffset.UTC).toEpochMilli(),
     ): Flow<List<Song>>
 
+    fun mostPlayedSong(
+        fromTimeStamp: Long = 0L,
+        toTimeStamp: Long? = LocalDateTime.now().toInstant(ZoneOffset.UTC).toEpochMilli(),
+    ): Flow<Song?> = mostPlayedSongs(
+        fromTimeStamp = fromTimeStamp,
+        limit = 1,
+        offset = 0,
+        toTimeStamp = toTimeStamp,
+    ).map { it.firstOrNull() }
+
     @Transaction
     @SuppressWarnings(RoomWarnings.QUERY_MISMATCH)
     @Query(
