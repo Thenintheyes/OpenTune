@@ -145,7 +145,7 @@ fun PoTokenScreen(
             val playerToken = data?.getStringExtra(PoTokenExtractionActivity.EXTRA_PLAYER_TOKEN).orEmpty()
             val visitorData = data?.getStringExtra(PoTokenExtractionActivity.EXTRA_VISITOR_DATA).orEmpty()
 
-            if (gvsToken.isNotBlank() && playerToken.isNotBlank() && visitorData.isNotBlank()) {
+            if (gvsToken.isNotBlank() && visitorData.isNotBlank()) {
                 viewModel.onTokensExtracted(
                     visitorData = visitorData,
                     poToken = gvsToken,

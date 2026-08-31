@@ -40,7 +40,6 @@ import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.arturo254.opentune.R
-import com.arturo254.opentune.innertube.utils.PoTokenGenerator
 import com.arturo254.opentune.ui.component.IconButton
 
 class PoTokenExtractionActivity : ComponentActivity() {
@@ -58,6 +57,7 @@ class PoTokenExtractionActivity : ComponentActivity() {
     private var activeWebView: WebView? = null
     private var extractedVisitorData: String? = null
     private var extractedGvsToken: String? = null
+    private var extractedPlayerToken: String? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -146,7 +146,7 @@ class PoTokenExtractionActivity : ComponentActivity() {
             val gvsToken = extractedGvsToken ?: return
             isExtracting = false
 
-            val playerToken = PoTokenGenerator.generateColdStartToken(visitorData, "player")
+            val playerToken = extractedPlayerToken?.takeIf { it.isNotBlank() } ?: ""
 
             setResult(
                 Activity.RESULT_OK,
@@ -170,6 +170,7 @@ class PoTokenExtractionActivity : ComponentActivity() {
 
             extractedVisitorData = null
             extractedGvsToken = null
+            extractedPlayerToken = null
 
             webView?.evaluateJavascript(
                 "(function(){try{return window.yt?.config_?.VISITOR_DATA || window.ytcfg?.get?.('VISITOR_DATA') || '';}catch(e){return '';}})();"
@@ -193,12 +194,6 @@ class PoTokenExtractionActivity : ComponentActivity() {
 
             webView?.postDelayed({
                 if (isFinishing) return@postDelayed
-                val visitor = extractedVisitorData
-                if (!visitor.isNullOrBlank() && extractedGvsToken.isNullOrBlank()) {
-                    extractedGvsToken = PoTokenGenerator.generateSessionToken(visitor)
-                    completeIfReady()
-                    return@postDelayed
-                }
                 if (extractedVisitorData.isNullOrBlank() || extractedGvsToken.isNullOrBlank()) {
                     isExtracting = false
                     Toast.makeText(context, R.string.token_generation_failed, Toast.LENGTH_SHORT).show()
