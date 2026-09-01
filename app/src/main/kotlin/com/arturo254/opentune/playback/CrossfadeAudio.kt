@@ -24,27 +24,150 @@ import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import com.arturo254.opentune.constants.CrossfadeType
 import com.arturo254.opentune.db.MusicDatabase
 import com.arturo254.opentune.extensions.metadata
+import kotlinx.coroutines.flow.StateFlow
+import timber.log.Timber
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.cos
+import kotlin.math.ln
 import kotlin.math.min
 import kotlin.math.pow
 import kotlin.math.sin
+import kotlin.math.sqrt
+import kotlin.math.tanh
 
 internal class CrossfadeAudio(
     private val player: ExoPlayer,
     private val database: MusicDatabase,
     private val crossfadeDurationMs: MutableStateFlow<Int>,
+    private val crossfadeType: MutableStateFlow<CrossfadeType>,
     private val playbackFadeFactor: MutableStateFlow<Float>,
     private val playerVolume: MutableStateFlow<Float>,
     private val audioFocusVolumeFactor: MutableStateFlow<Float>,
     private val audioNormalizationEnabled: MutableStateFlow<Boolean>,
     private val maxSafeGainFactor: Float,
+    private val sharedNormalizeFactor: StateFlow<Float>,
+    private val mainCrossfadeProcessor: CrossfadeAudioProcessor? = null,
+    private val overlapCrossfadeProcessor: CrossfadeAudioProcessor? = null,
     private val overlapPlayerFactory: () -> ExoPlayer,
     private val onCrossfadeStart: (MediaItem) -> Unit = {},
+    private val onHandoffNormalizeSnap: (targetFactor: Float, postHandoffRampMs: Int) -> Unit = { _, _ -> },
+    private val streamFadesBypassController: ((bypassed: Boolean, applyNextStartOnly: Boolean) -> Unit)? = null,
+    private val onCrossfadeAndHandoffAllFinished: () -> Unit = {},
 ) {
+
+    // ── Curvas de crossfade DSP ────────────────────────────────────────────────
+
+    /**
+     * Calcula los factores de volumen para el fundido según [CrossfadeType].
+     * Devuelve un par (outgoingGain, incomingGain) ambos en rango [0, 1].
+     *
+     * @param t Progreso normalizado de la transición [0..1]
+     */
+    private fun computeCrossfadeGains(t: Float, type: CrossfadeType): Pair<Float, Float> {
+        val clampedT = t.coerceIn(0f, 1f)
+        return when (type) {
+            CrossfadeType.EQUAL_POWER -> {
+                // sin/cos equal-power: sin²θ + cos²θ = 1 → potencia constante
+                val theta = clampedT * (PI / 2.0)
+                cos(theta).toFloat() to sin(theta).toFloat()
+            }
+
+            CrossfadeType.LINEAR -> {
+                (1f - clampedT) to clampedT
+            }
+
+            CrossfadeType.LOGARITHMIC -> {
+                // Logarítmico: fade-in suave, fade-out rápido
+                val eps = 0.001f
+                val out = (ln((1f - clampedT) * (1f - eps) + eps) / ln(eps)).coerceIn(0f, 1f)
+                val inc = (ln(clampedT * (1f - eps) + eps) / ln(eps)).coerceIn(0f, 1f)
+                (1f - out) to inc
+            }
+
+            CrossfadeType.EXPONENTIAL -> {
+                // Exponencial: fade-in rápido, fade-out suave
+                val k = 3f
+                val expIn = (1f - Math.exp(-k * clampedT.toDouble()).toFloat() /
+                    (1f - Math.exp(-k.toDouble()).toFloat())).coerceIn(0f, 1f)
+                val expOut = (1f - Math.exp(-k * (1 - clampedT).toDouble()).toFloat() /
+                    (1f - Math.exp(-k.toDouble()).toFloat())).coerceIn(0f, 1f)
+                (1f - expOut) to expIn
+            }
+
+            CrossfadeType.SMOOTHSTEP -> {
+                // smoothstep(t) = 3t² - 2t³
+                val s = clampedT * clampedT * (3f - 2f * clampedT)
+                (1f - s) to s
+            }
+
+            CrossfadeType.SMOOTHERSTEP -> {
+                // smootherstep(t) = 6t⁵ - 15t⁴ + 10t³
+                val s = clampedT * clampedT * clampedT * (
+                    clampedT * (clampedT * 6f - 15f) + 10f
+                )
+                (1f - s) to s
+            }
+
+            CrossfadeType.CONSTANT_GAIN -> {
+                // Ganancia constante: suma lineal de amplitudes (no potencia)
+                // Para mantener suma ≈ 1 usamos raíces
+                val a = sqrt(1f - clampedT)
+                val b = sqrt(clampedT)
+                a to b
+            }
+
+            CrossfadeType.FAST_START -> {
+                // incoming aparece muy rápido al principio
+                val inc = 1f - (1f - clampedT).pow(3)
+                val out = (1f - clampedT).pow(1.5f)
+                out to inc
+            }
+
+            CrossfadeType.SLOW_START -> {
+                // incoming aparece muy suave al principio
+                val inc = clampedT.pow(3)
+                val out = 1f - (1f - clampedT).pow(0.35f)
+                (1f - out) to inc
+            }
+
+            CrossfadeType.WAVE_MIX -> {
+                // Mezcla de ondas con fase desplazada
+                val theta = clampedT * PI
+                val out = ((1.0 + cos(theta)) * 0.5).toFloat()
+                val inc = ((1.0 - cos(theta)) * 0.5).toFloat()
+                out to inc
+            }
+
+            CrossfadeType.TRIANGLE -> {
+                // Triangular / tiesto: crossover asimétrico lineal
+                // outgoing empieza a bajar antes; incoming llega a 1 antes
+                val out = when {
+                    clampedT < 0.5f -> 1f
+                    else -> 2f * (1f - clampedT)
+                }
+                val inc = when {
+                    clampedT < 0.5f -> clampedT * 2f
+                    else -> 1f
+                }
+                out to inc
+            }
+
+            CrossfadeType.DIPPED -> {
+                // Hundimiento en medio: ambos bajan brevemente → enfatiza el corte
+                val dip = when {
+                    clampedT < 0.5f -> 1f - (sin(clampedT * PI).toFloat() * 0.45f)
+                    else -> 1f - (sin((1f - clampedT) * PI).toFloat() * 0.45f)
+                }
+                val rawOut = 1f - clampedT
+                val rawIn = clampedT
+                (rawOut * dip) to (rawIn * dip)
+            }
+        }
+    }
     // ── Estado del loop ───────────────────────────────────────────────────────
 
     private var loopJob: Job? = null
@@ -70,12 +193,17 @@ internal class CrossfadeAudio(
     private var handoffLastSyncSeekElapsedMs: Long = 0L
     private var handoffSeekIssued = false
     private var handoffRampStarted = false
+    private var handoffMainStartFade: Float = 0f
+    private var handoffOverlapStartFade: Float = 0f
+    private var postHandoffOverlapDrainUntil: Long = 0L
 
     // Constantes de handoff
     private val handoffReseekMinIntervalMs = 180L
     private val handoffDriftCorrectionThresholdMs = 220L
     private val handoffRampStartDriftToleranceMs = 120L
     private val handoffTimeoutMs = 5000L
+    private val handoffStandardDurationMs = 550
+    private val postHandoffOverlapDrainMs = 120L
 
     // ── Buffer mínimo antes de arrancar el crossfade ──────────────────────────
 
@@ -113,6 +241,7 @@ internal class CrossfadeAudio(
         stopOverlapCrossfade(resetMainFade = true)
         runCatching { overlapPlayer?.release() }
         overlapPlayer = null
+        setStreamFadesBypassed(false)
     }
 
     // ── Loop principal ────────────────────────────────────────────────────────
@@ -120,6 +249,26 @@ internal class CrossfadeAudio(
     private suspend fun runLoop() {
         while (kotlin.coroutines.coroutineContext.isActive) {
             val fadeMs = crossfadeDurationMs.value
+            val now = android.os.SystemClock.elapsedRealtime()
+
+            // Fase post-handoff: dejar de drenar overlap sin crossfadeActive ni handoffActive
+            if (postHandoffOverlapDrainUntil > 0L) {
+                if (now >= postHandoffOverlapDrainUntil) {
+                    val overlap = overlapPlayer
+                    if (overlap != null) {
+                        runCatching {
+                            overlap.volume = 0f
+                            overlap.stop()
+                            overlap.clearMediaItems()
+                        }
+                    }
+                    postHandoffOverlapDrainUntil = 0L
+                    onCrossfadeAndHandoffAllFinished()
+                } else {
+                    delay(25)
+                    continue
+                }
+            }
 
             if (fadeMs <= 0) {
                 stopOverlapCrossfade(resetMainFade = true)
@@ -136,7 +285,7 @@ internal class CrossfadeAudio(
             // Durante el handoff solo actualizar volúmenes
             if (handoffActive) {
                 updateVolumes()
-                delay(50)
+                delay(20)
                 continue
             }
 
@@ -186,6 +335,14 @@ internal class CrossfadeAudio(
                 val currentId = player.currentMediaItem?.mediaId
                 val onTarget = !targetId.isNullOrBlank() && targetId == currentId
 
+                if (onTarget && !handoffActive) {
+                    playbackFadeFactor.value = 0f
+                    beginHandoffFromOverlap()
+                    updateVolumes()
+                    delay(20)
+                    continue
+                }
+
                 if (!onTarget && (nextIndex == C.INDEX_UNSET || durationMs <= 0 || durationMs == C.TIME_UNSET)) {
                     stopOverlapCrossfade(resetMainFade = true)
                     delay(150)
@@ -203,7 +360,7 @@ internal class CrossfadeAudio(
                 }
 
                 updateVolumes()
-                delay(50)
+                delay(20)
                 continue
             }
 
@@ -298,6 +455,11 @@ internal class CrossfadeAudio(
         stopOverlapCrossfade(resetMainFade = false)
     }
 
+    private fun setStreamFadesBypassed(bypassed: Boolean) {
+        mainCrossfadeProcessor?.streamFadesBypassed = bypassed
+        overlapCrossfadeProcessor?.streamFadesBypassed = bypassed
+    }
+
     private fun beginOverlapCrossfade(fadeMs: Int, remainingMs: Long) {
         if (overlapPlayer == null) return
 
@@ -306,41 +468,30 @@ internal class CrossfadeAudio(
             onCrossfadeStart(player.getMediaItemAt(targetIndex))
         }
 
+        setStreamFadesBypassed(true)
         crossfadeActive = true
         crossfadeStartElapsedMs = android.os.SystemClock.elapsedRealtime()
-        crossfadeActiveDurationMs = min(fadeMs.toLong(), remainingMs).toInt().coerceAtLeast(1)
+        // FIX transición discordante: duración SIEMPRE es la que pidió el usuario en el slider,
+        // no el mínimo con remainingMs. Si remainingMs < fadeMs (ej: el buffer check tardó),
+        // la curva DSP seguirá avanzando a velocidad real t = elapsed / fadeMs hasta alcanzar
+        // t=1, alineada con el handoff post-media-item-transition que marca ExoPlayer.
+        // Si remainingMs > fadeMs, el overlap simplemente queda "listo" antes y queda a la
+        // espera del final real del stream emitido por onMediaItemTransition.
+        crossfadeActiveDurationMs = fadeMs.coerceAtLeast(1)
         crossfadeTargetIndex = overlapPrimedIndex
         crossfadeTargetMediaId = overlapPrimedMediaId
     }
 
-    // ── Actualización de volúmenes (equal-power) ──────────────────────────────
+    // ── Actualización de volúmenes (por CrossfadeType) ────────────────────────
 
     /**
-     * Aplica la curva de crossfade equal-power usando sin/cos.
+     * Calcula los gains del crossfade tipificado sin tocar player.volume,
+     * ya que este lo gestiona MusicService a través de playbackFadeFactor.
      *
-     * Con una curva lineal la suma de potencias cae ~3 dB en t=0.5.
-     * Con sin/cos se mantiene constante (sin²θ + cos²θ = 1),
-     * eliminando el "dip" perceptual en el centro del fundido.
-     *
-     * @param t          Progreso normalizado [0..1]
-     * @param baseVolume Volumen base del player principal
-     * @param outgoing   Player que está saliendo (volumen decrece: cos)
-     * @param incoming   Player que está entrando  (volumen crece:  sin)
+     * @return (outgoingGain, incomingGain) ambos en [0, 1]
      */
-    private fun applyEqualPowerVolumes(
-        t: Float,
-        baseVolume: Float,
-        outgoing: ExoPlayer,
-        incoming: ExoPlayer,
-    ) {
-        val clamped = t.coerceIn(0f, 1f)
-        val radians = clamped.toDouble() * (PI / 2.0)
-
-        // outgoing: 1→0 siguiendo coseno
-        // incoming: 0→1 siguiendo seno
-        outgoing.volume = (baseVolume * cos(radians).toFloat()).coerceIn(0f, maxSafeGainFactor)
-        incoming.volume = (baseVolume * sin(radians).toFloat()).coerceIn(0f, maxSafeGainFactor)
-    }
+    private fun computeTypedGains(t: Float): Pair<Float, Float> =
+        computeCrossfadeGains(t, crossfadeType.value)
 
     private fun updateVolumes() {
         val overlap = overlapPlayer ?: run {
@@ -348,8 +499,12 @@ internal class CrossfadeAudio(
             return
         }
 
+        // NOTA: ambos players (main y overlap) comparten el MISMO `sharedNormalizeFactor`.
+        // La fuente de verdad es única (StateFlow del collector currentFormat en MusicService).
+        // Antes usábamos `overlapNormalizeFactor` (un segundo fetch desde Room) que a menudo
+        // difería del valor final del stream y provocaba picos de volumen aleatorios en el handoff.
         val baseOverlapVolume =
-            (playerVolume.value * overlapNormalizeFactor * audioFocusVolumeFactor.value)
+            (playerVolume.value * sharedNormalizeFactor.value * audioFocusVolumeFactor.value)
                 .coerceIn(0f, 1f)
 
         // ── Fase de handoff ───────────────────────────────────────────────────
@@ -384,8 +539,7 @@ internal class CrossfadeAudio(
                     player.seekTo(currentIndex, handoffTargetPositionMs)
                     handoffLastSyncSeekElapsedMs = nowElapsedMs
                 }
-                playbackFadeFactor.value = 0f
-                overlap.volume = baseOverlapVolume
+                // NO forzamos jumps: mantenemos niveles capturados en beginHandoffFromOverlap
                 return
             }
 
@@ -398,8 +552,6 @@ internal class CrossfadeAudio(
                             abs(positionDriftMs) <= handoffRampStartDriftToleranceMs
 
                 if (!mainStable) {
-                    playbackFadeFactor.value = 0f
-                    overlap.volume = baseOverlapVolume
                     return
                 }
 
@@ -409,35 +561,39 @@ internal class CrossfadeAudio(
 
             val denom = handoffDurationMs.toLong().coerceAtLeast(1L)
             val elapsed = (nowElapsedMs - handoffStartElapsedMs).coerceAtLeast(0L)
-            val t = (elapsed.toFloat() / denom.toFloat()).coerceIn(0f, 1f)
+            val linearT = (elapsed.toFloat() / denom.toFloat()).coerceIn(0f, 1f)
+            val smoothT = linearT * linearT * (3f - 2f * linearT)
 
-            // Handoff: ramp lineal corto (450 ms) — suficiente para que no se note
-            playbackFadeFactor.value = t
-            overlap.volume = (baseOverlapVolume * (1f - t)).coerceIn(0f, 1f)
+            val mainTarget = 1f
+            val mainGain = handoffMainStartFade + smoothT * (mainTarget - handoffMainStartFade)
+            playbackFadeFactor.value = mainGain.coerceIn(0f, 1f)
 
-            if (t >= 1f) completeHandoffFromOverlap()
+            val overlapTarget = 0f
+            val overlapGain = handoffOverlapStartFade + smoothT * (overlapTarget - handoffOverlapStartFade)
+            overlap.volume = (baseOverlapVolume * overlapGain.coerceIn(0f, 1f)).coerceIn(0f, 1f)
+
+            if (linearT >= 1f) completeHandoffFromOverlap()
             return
         }
 
-        // ── Fase de crossfade activo (equal-power) ────────────────────────────
+        // ── Fase de crossfade activo (según CrossfadeType) ────────────────────
         val denom = crossfadeActiveDurationMs.toLong().coerceAtLeast(1L)
         val elapsed = (android.os.SystemClock.elapsedRealtime() - crossfadeStartElapsedMs).coerceAtLeast(0L)
         val t = (elapsed.toFloat() / denom.toFloat()).coerceIn(0f, 1f)
 
-        // Calculamos el factor del player principal a través del flujo playbackFadeFactor
-        // para que el volumen final del player principal sea:
-        //   player.volume = playerVolume * normalizeFactor * audioFocusFactor * playbackFadeFactor
-        //                 = baseMainVolume * cos(t * π/2)
+        // IMPORTANTE: el volumen del player principal NO lo asignamos aquí.
+        // Se aplica vía playbackFadeFactor que MusicService multiplica en su
+        // combine(playerVolume, normalizeFactor, audioFocusVolumeFactor, playbackFadeFactor).
         //
-        // Necesitamos que playbackFadeFactor = cos(t * π/2), ya que los demás factores
-        // se combinan en el collect de MusicService.
-        val radians = t.toDouble() * (PI / 2.0)
-        playbackFadeFactor.value = cos(radians).toFloat().coerceIn(0f, 1f)
+        // Volumen final del main:   baseMainVolume * playbackFadeFactor (= outgoingGain)
+        // Volumen final del overlap: baseOverlapVolume * incomingGain (lo asignamos aquí)
+        val (outgoingGain, incomingGain) = computeTypedGains(t)
 
-        // El overlap no pasa por playbackFadeFactor, así que aplicamos el volumen completo
-        // directamente con la curva seno.
-        overlap.volume =
-            (baseOverlapVolume * sin(radians).toFloat()).coerceIn(0f, maxSafeGainFactor)
+        // Propagamos el gain del outgoing (main) a través de playbackFadeFactor
+        playbackFadeFactor.value = outgoingGain.coerceIn(0f, 1f)
+
+        // Aplicamos el gain del incoming (overlap) directamente sobre su volumen
+        overlap.volume = (baseOverlapVolume * incomingGain).coerceIn(0f, maxSafeGainFactor)
     }
 
     // ── Transición de MediaItem ───────────────────────────────────────────────
@@ -451,6 +607,7 @@ internal class CrossfadeAudio(
         if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO &&
             !targetId.isNullOrBlank() && targetId == newId
         ) {
+            playbackFadeFactor.value = 0f
             beginHandoffFromOverlap()
             return
         }
@@ -467,15 +624,29 @@ internal class CrossfadeAudio(
         }
 
         val overlapPositionMs = overlap.currentPosition.coerceAtLeast(0L)
+        val now = android.os.SystemClock.elapsedRealtime()
+        // Un solo StateFlow compartido = misma loudness en main y overlap.
+        val baseOverlapVolume =
+            (playerVolume.value * sharedNormalizeFactor.value * audioFocusVolumeFactor.value)
+                .coerceIn(0f, 1f)
+        val currentOverlapGain =
+            if (baseOverlapVolume <= 0f) 0f
+            else (overlap.volume / baseOverlapVolume).coerceIn(0f, 1f)
 
         handoffActive = true
         handoffSeekIssued = false
         handoffRampStarted = false
         handoffTargetPositionMs = overlapPositionMs
-        handoffStartElapsedMs = android.os.SystemClock.elapsedRealtime()
+        handoffStartElapsedMs = now
         handoffLastSyncSeekElapsedMs = 0L
-        handoffDurationMs = 450
-        playbackFadeFactor.value = 0f
+        handoffDurationMs = handoffStandardDurationMs + (crossfadeDurationMs.value * 0.15f).toInt()
+            .coerceAtLeast(550)
+            .coerceAtMost(950)
+        handoffMainStartFade = playbackFadeFactor.value.coerceIn(0f, 1f)
+        handoffOverlapStartFade = currentOverlapGain.coerceIn(0f, 1f)
+        // Snap al valor compartido actual (main == overlap → snap no cambia nada, ya no hay race;
+        // mantenemos la callback solo por si MusicService quería log o cleanups futuros).
+        onHandoffNormalizeSnap(sharedNormalizeFactor.value.coerceIn(0.2f, maxSafeGainFactor), 300)
     }
 
     private fun completeHandoffFromOverlap() {
@@ -484,11 +655,9 @@ internal class CrossfadeAudio(
             return
         }
 
-        runCatching {
-            overlap.volume = 0f
-            overlap.stop()
-            overlap.clearMediaItems()
-        }
+        val now = android.os.SystemClock.elapsedRealtime()
+        playbackFadeFactor.value = 1f
+        runCatching { overlap.volume = 0f }
 
         handoffActive = false
         handoffStartElapsedMs = 0L
@@ -505,8 +674,12 @@ internal class CrossfadeAudio(
         overlapNormalizeFactor = 1f
         overlapPrimedIndex = C.INDEX_UNSET
         overlapPrimedMediaId = null
+        postHandoffOverlapDrainUntil = now +
+                (crossfadeDurationMs.value.toLong() * 5L / 4L).coerceAtLeast(postHandoffOverlapDrainMs + 120L) +
+                300L
 
-        playbackFadeFactor.value = 1f
+        streamFadesBypassController?.invoke(true, true)
+        setStreamFadesBypassed(false)
     }
 
     // ── Stop / reset ──────────────────────────────────────────────────────────
@@ -535,6 +708,7 @@ internal class CrossfadeAudio(
             }
         }
 
+        setStreamFadesBypassed(false)
         if (resetMainFade) {
             playbackFadeFactor.value = 1f
         }

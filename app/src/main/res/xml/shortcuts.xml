@@ -1,5 +1,46 @@
 <?xml version="1.0" encoding="utf-8"?>
 <shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <capabilities>
+        <capability android:name="actions.intent.PLAY_AUDIO">
+            <intent
+                android:action="android.media.action.MEDIA_PLAY_FROM_SEARCH"
+                android:targetClass="com.arturo254.opentune.MainActivity"
+                android:targetPackage="com.arturo254.opentune">
+                <parameter
+                    android:name="musicRecognitionSong"
+                    android:key="query"
+                    android:mimeType="text/*" />
+                <parameter
+                    android:name="musicArtist"
+                    android:key="artist"
+                    android:mimeType="text/*" />
+                <parameter
+                    android:name="musicAlbum"
+                    android:key="album"
+                    android:mimeType="text/*" />
+                <parameter
+                    android:name="musicPlaylist"
+                    android:key="playlist"
+                    android:mimeType="text/*" />
+                <parameter
+                    android:name="musicGenre"
+                    android:key="genre"
+                    android:mimeType="text/*" />
+                <parameter
+                    android:name="query"
+                    android:key="query"
+                    android:mimeType="text/*" />
+            </intent>
+        </capability>
+
+        <capability android:name="actions.intent.CREATE_MEDIA_PLAYLIST">
+            <intent
+                android:action="android.intent.action.CREATE_SHORTCUT"
+                android:targetClass="com.arturo254.opentune.MainActivity"
+                android:targetPackage="com.arturo254.opentune" />
+        </capability>
+    </capabilities>
+
     <shortcut
         android:enabled="true"
         android:icon="@drawable/shortcut_search"

@@ -47,6 +47,8 @@ import com.arturo254.opentune.constants.AudioNormalizationKey
 import com.arturo254.opentune.constants.AudioOffload
 import com.arturo254.opentune.constants.AudioQuality
 import com.arturo254.opentune.constants.AudioQualityKey
+import com.arturo254.opentune.constants.AudioCrossfadeTypeKey
+import com.arturo254.opentune.constants.CrossfadeType
 import com.arturo254.opentune.constants.NetworkMeteredKey
 import com.arturo254.opentune.constants.AutoDownloadOnLikeKey
 import com.arturo254.opentune.constants.AutoStartOnBluetoothKey
@@ -151,6 +153,10 @@ fun PlayerSettings(
     val (audioCrossfadeSeconds, onAudioCrossfadeSecondsChange) = rememberPreference(
         AudioCrossfadeDurationKey,
         defaultValue = 0
+    )
+    val (audioCrossfadeType, onAudioCrossfadeTypeChange) = rememberEnumPreference(
+        AudioCrossfadeTypeKey,
+        defaultValue = CrossfadeType.DEFAULT
     )
 
     val (artistSeparators, onArtistSeparatorsChange) = rememberPreference(
@@ -314,6 +320,8 @@ fun PlayerSettings(
         CrossfadeSliderPreference(
             value = audioCrossfadeSeconds,
             onValueChange = onAudioCrossfadeSecondsChange,
+            crossfadeType = audioCrossfadeType,
+            onCrossfadeTypeChange = onAudioCrossfadeTypeChange,
             isEnabled = !audioOffload,
         )
 

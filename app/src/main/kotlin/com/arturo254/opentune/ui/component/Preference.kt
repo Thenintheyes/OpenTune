@@ -79,9 +79,14 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Canvas
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
@@ -92,7 +97,16 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.arturo254.opentune.R
+import com.arturo254.opentune.constants.CrossfadeType
+import com.arturo254.opentune.constants.description
+import com.arturo254.opentune.constants.displayName
 import me.saket.squiggles.SquigglySlider
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.ln
+import kotlin.math.pow
+import kotlin.math.sin
+import kotlin.math.sqrt
 import kotlin.math.roundToInt
 
 val LocalPreferenceInGroup = compositionLocalOf { false }
@@ -558,19 +572,205 @@ fun SliderPreference(
     )
 }
 
+// ── Helper de curvas de crossfade (duplicado UI-safe respecto a CrossfadeAudio) ──
+private object CrossfadeCurvePreviewUtils {
+    fun computeGains(t: Float, type: CrossfadeType): Pair<Float, Float> {
+        val clampedT = t.coerceIn(0f, 1f)
+        return when (type) {
+            CrossfadeType.EQUAL_POWER -> {
+                val theta = clampedT * (PI / 2.0)
+                cos(theta).toFloat() to sin(theta).toFloat()
+            }
+            CrossfadeType.LINEAR -> (1f - clampedT) to clampedT
+            CrossfadeType.LOGARITHMIC -> {
+                val eps = 0.001f
+                val out = (ln((1f - clampedT) * (1f - eps) + eps) / ln(eps)).coerceIn(0f, 1f)
+                val inc = (ln(clampedT * (1f - eps) + eps) / ln(eps)).coerceIn(0f, 1f)
+                (1f - out) to inc
+            }
+            CrossfadeType.EXPONENTIAL -> {
+                val k = 3f
+                val expIn = (1f - Math.exp(-k * clampedT.toDouble()).toFloat() /
+                    (1f - Math.exp(-k.toDouble()).toFloat())).coerceIn(0f, 1f)
+                val expOut = (1f - Math.exp(-k * (1 - clampedT).toDouble()).toFloat() /
+                    (1f - Math.exp(-k.toDouble()).toFloat())).coerceIn(0f, 1f)
+                (1f - expOut) to expIn
+            }
+            CrossfadeType.SMOOTHSTEP -> {
+                val s = clampedT * clampedT * (3f - 2f * clampedT)
+                (1f - s) to s
+            }
+            CrossfadeType.SMOOTHERSTEP -> {
+                val s = clampedT * clampedT * clampedT * (
+                    clampedT * (clampedT * 6f - 15f) + 10f
+                )
+                (1f - s) to s
+            }
+            CrossfadeType.CONSTANT_GAIN -> {
+                sqrt(1f - clampedT) to sqrt(clampedT)
+            }
+            CrossfadeType.FAST_START -> {
+                val inc = 1f - (1f - clampedT).pow(3)
+                val out = (1f - clampedT).pow(1.5f)
+                out to inc
+            }
+            CrossfadeType.SLOW_START -> {
+                val inc = clampedT.pow(3)
+                val out = 1f - (1f - clampedT).pow(0.35f)
+                (1f - out) to inc
+            }
+            CrossfadeType.WAVE_MIX -> {
+                val theta = clampedT * PI
+                val out = ((1.0 + cos(theta)) * 0.5).toFloat()
+                val inc = ((1.0 - cos(theta)) * 0.5).toFloat()
+                out to inc
+            }
+            CrossfadeType.TRIANGLE -> {
+                val out = when {
+                    clampedT < 0.5f -> 1f
+                    else -> 2f * (1f - clampedT)
+                }
+                val inc = when {
+                    clampedT < 0.5f -> clampedT * 2f
+                    else -> 1f
+                }
+                out to inc
+            }
+            CrossfadeType.DIPPED -> {
+                val dip = when {
+                    clampedT < 0.5f -> 1f - (sin(clampedT * PI).toFloat() * 0.45f)
+                    else -> 1f - (sin((1f - clampedT) * PI).toFloat() * 0.45f)
+                }
+                val rawOut = 1f - clampedT
+                val rawIn = clampedT
+                (rawOut * dip) to (rawIn * dip)
+            }
+        }
+    }
+}
+
+@Composable
+private fun CrossfadeCurvePreview(
+    type: CrossfadeType,
+    isSelected: Boolean,
+    modifier: Modifier = Modifier,
+    widthDp: Int = 140,
+    heightDp: Int = 70,
+) {
+    val outgoingColor = if (isSelected) {
+        MaterialTheme.colorScheme.primary
+    } else {
+        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.7f)
+    }
+    val incomingColor = if (isSelected) {
+        MaterialTheme.colorScheme.tertiary
+    } else {
+        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f)
+    }
+    val gridColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)
+    val sumHighlight = if (isSelected) {
+        MaterialTheme.colorScheme.primary.copy(alpha = 0.12f)
+    } else {
+        Color.Unspecified
+    }
+
+    androidx.compose.foundation.Canvas(
+        modifier = modifier
+            .size(widthDp.dp, heightDp.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(
+                if (isSelected) {
+                    MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.25f)
+                } else {
+                    MaterialTheme.colorScheme.surfaceContainerHighest.copy(alpha = 0.5f)
+                }
+            )
+            .padding(6.dp)
+    ) {
+        val w = size.width
+        val h = size.height
+        val samples = 40
+        val stepX = w / samples.toFloat()
+
+        // ── Grid suave ────────────────────────────────────────────────────
+        // Línea horizontal central (y = 0.5)
+        drawLine(
+            color = gridColor,
+            start = Offset(0f, h * 0.5f),
+            end = Offset(w, h * 0.5f),
+            strokeWidth = 0.8.dp.toPx(),
+        )
+        // Linea vertical central (t = 0.5)
+        drawLine(
+            color = gridColor,
+            start = Offset(w * 0.5f, 0f),
+            end = Offset(w * 0.5f, h),
+            strokeWidth = 0.8.dp.toPx(),
+        )
+
+        // ── Área de suma (solo cuando está seleccionado) ─────────────────
+        if (sumHighlight != Color.Unspecified) {
+            val sumPath = Path().apply {
+                moveTo(0f, h)
+                for (i in 0..samples) {
+                    val t = i / samples.toFloat()
+                    val (outG, inG) = CrossfadeCurvePreviewUtils.computeGains(t, type)
+                    val sum = (outG + inG).coerceAtMost(1.414f)
+                    val x = i * stepX
+                    val y = h - (sum / 1.414f) * h
+                    lineTo(x, y)
+                }
+                lineTo(w, h)
+                close()
+            }
+            drawPath(path = sumPath, color = sumHighlight)
+        }
+
+        // ── Curvas ───────────────────────────────────────────────────────
+        fun buildPath(isOutgoing: Boolean): Path = Path().apply {
+            val first = true
+            for (i in 0..samples) {
+                val t = i / samples.toFloat()
+                val (outG, inG) = CrossfadeCurvePreviewUtils.computeGains(t, type)
+                val gain = if (isOutgoing) outG else inG
+                val x = i * stepX
+                val y = h - gain * h
+                if (first && i == 0) moveTo(x, y) else lineTo(x, y)
+            }
+        }
+
+        drawPath(
+            path = buildPath(isOutgoing = true),
+            color = outgoingColor,
+            style = Stroke(width = if (isSelected) 2.4.dp.toPx() else 1.8.dp.toPx())
+        )
+        drawPath(
+            path = buildPath(isOutgoing = false),
+            color = incomingColor,
+            style = Stroke(width = if (isSelected) 2.4.dp.toPx() else 1.8.dp.toPx())
+        )
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun CrossfadeSliderPreference(
     modifier: Modifier = Modifier,
     value: Int,
     onValueChange: (Int) -> Unit,
+    crossfadeType: CrossfadeType,
+    onCrossfadeTypeChange: (CrossfadeType) -> Unit,
     isEnabled: Boolean = true,
 ) {
     var showBottomSheet by remember { mutableStateOf(false) }
     var localValue by remember { mutableFloatStateOf(value.toFloat()) }
+    var localType by remember { mutableStateOf(crossfadeType) }
 
     androidx.compose.runtime.LaunchedEffect(value) {
         localValue = value.toFloat()
+    }
+    androidx.compose.runtime.LaunchedEffect(crossfadeType) {
+        localType = crossfadeType
     }
 
     val displayValue = localValue.roundToInt().coerceIn(0, 10)
@@ -578,39 +778,67 @@ fun CrossfadeSliderPreference(
 
     val descriptionText = when (displayValue) {
         0 -> stringResource(R.string.crossfade_disabled_description)
-        else -> pluralStringResource(R.plurals.seconds, displayValue, displayValue)
+        else -> buildString {
+            append(localType.displayName())
+            append(" • ")
+            append(
+                androidx.compose.ui.res.pluralStringResource(
+                    id = R.plurals.seconds,
+                    count = displayValue,
+                    displayValue
+                )
+            )
+        }
     }
+
+    val availableTypes = remember { CrossfadeType.values().toList() }
 
     if (showBottomSheet) {
         ExpressiveActionBottomSheet(
             titleBar = {
-                Text(
-                    text = stringResource(R.string.audio_crossfade_title),
-                    style = MaterialTheme.typography.headlineSmall.copy(
-                        fontWeight = FontWeight.SemiBold
-                    ),
-                    color = MaterialTheme.colorScheme.primary,
-                    modifier = Modifier.fillMaxWidth()
-                )
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Text(
+                        text = stringResource(R.string.audio_crossfade_title),
+                        style = MaterialTheme.typography.headlineSmall.copy(
+                            fontWeight = FontWeight.SemiBold
+                        ),
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                    Text(
+                        text = localType.description(),
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        ),
+                        modifier = Modifier.padding(top = 2.dp)
+                    )
+                }
             },
             onDismiss = {
                 localValue = value.toFloat()
+                localType = crossfadeType
                 showBottomSheet = false
             },
             onConfirm = {
                 val finalValue = localValue.roundToInt().coerceIn(0, 10)
                 onValueChange(finalValue)
+                onCrossfadeTypeChange(localType)
                 showBottomSheet = false
             },
             onCancel = {
                 localValue = value.toFloat()
+                localType = crossfadeType
                 showBottomSheet = false
+            },
+            onReset = {
+                localValue = 0f
+                localType = CrossfadeType.DEFAULT
             },
             content = {
                 Column(
                     horizontalAlignment = Alignment.CenterHorizontally,
                     modifier = Modifier.fillMaxWidth()
                 ) {
+                    // ── Valor numérico grande ─────────────────────────────────
                     val valueColor by animateColorAsState(
                         targetValue = if (isCrossfadeEnabled) {
                             MaterialTheme.colorScheme.primary
@@ -633,7 +861,7 @@ fun CrossfadeSliderPreference(
                         color = valueColor,
                     )
 
-                    Spacer(Modifier.height(24.dp))
+                    Spacer(Modifier.height(16.dp))
 
                     SquigglySlider(
                         value = localValue,
@@ -666,6 +894,187 @@ fun CrossfadeSliderPreference(
                             )
                         }
                     }
+
+                    // ── Selector de tipos con previews ────────────────────────
+                    Spacer(Modifier.height(28.dp))
+                    Text(
+                        text = stringResource(R.string.crossfade_transition_style),
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Text(
+                        text = stringResource(R.string.crossfade_transition_style_subtitle),
+                        style = MaterialTheme.typography.bodySmall.copy(
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        ),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(top = 2.dp, bottom = 10.dp)
+                    )
+
+                    LazyRow(
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                        contentPadding = PaddingValues(
+                            start = 2.dp,
+                            end = 2.dp,
+                            bottom = 2.dp
+                        )
+                    ) {
+                        itemsIndexed(
+                            items = availableTypes,
+                            key = { _, type -> type.name }
+                        ) { idx, type ->
+                            val isSelected = localType == type
+
+                            val animatedScale by animateFloatAsState(
+                                targetValue = if (isSelected) 1f else 0.97f,
+                                animationSpec = spring(
+                                    dampingRatio = Spring.DampingRatioLowBouncy,
+                                    stiffness = Spring.StiffnessMediumLow
+                                ),
+                                label = "cardScale_$idx"
+                            )
+                            val animatedBorder by animateColorAsState(
+                                targetValue = if (isSelected) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.4f)
+                                },
+                                animationSpec = MaterialTheme.motionScheme.defaultEffectsSpec(),
+                                label = "borderColor_$idx"
+                            )
+                            val animatedBg by animateColorAsState(
+                                targetValue = if (isSelected) {
+                                    MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.35f)
+                                } else {
+                                    MaterialTheme.colorScheme.surfaceContainerLow
+                                },
+                                animationSpec = MaterialTheme.motionScheme.defaultSpatialSpec(),
+                                label = "bgColor_$idx"
+                            )
+
+                            Surface(
+                                onClick = { localType = type },
+                                modifier = Modifier
+                                    .width(160.dp)
+                                    .graphicsLayer {
+                                        scaleX = animatedScale
+                                        scaleY = animatedScale
+                                    },
+                                shape = RoundedCornerShape(
+                                    topStart = 22.dp,
+                                    topEnd = 12.dp,
+                                    bottomStart = 12.dp,
+                                    bottomEnd = 22.dp
+                                ),
+                                color = animatedBg,
+                                border = BorderStroke(
+                                    width = if (isSelected) 1.8.dp else 1.dp,
+                                    color = animatedBorder
+                                ),
+                                tonalElevation = if (isSelected) 4.dp else 0.dp,
+                            ) {
+                                Column(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .padding(10.dp),
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    CrossfadeCurvePreview(
+                                        type = type,
+                                        isSelected = isSelected,
+                                    )
+                                    Spacer(Modifier.height(8.dp))
+                                    Text(
+                                        text = type.displayName(),
+                                        style = MaterialTheme.typography.titleSmall.copy(
+                                            fontWeight = if (isSelected) {
+                                                FontWeight.SemiBold
+                                            } else {
+                                                FontWeight.Medium
+                                            },
+                                            color = if (isSelected) {
+                                                MaterialTheme.colorScheme.onPrimaryContainer
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurface
+                                            }
+                                        ),
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                    Spacer(Modifier.height(3.dp))
+                                    Text(
+                                        text = type.description().take(48).let {
+                                            if (it.length < type.description().length) "$it…" else it
+                                        },
+                                        style = MaterialTheme.typography.labelSmall.copy(
+                                            color = if (isSelected) {
+                                                MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f)
+                                            } else {
+                                                MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f)
+                                            },
+                                            lineHeight = 12.sp
+                                        ),
+                                        maxLines = 2,
+                                        minLines = 2,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    // ── Detalle del tipo seleccionado ─────────────────────────
+                    Spacer(Modifier.height(18.dp))
+                    Surface(
+                        shape = RoundedCornerShape(
+                            topStart = 18.dp,
+                            topEnd = 10.dp,
+                            bottomStart = 10.dp,
+                            bottomEnd = 18.dp
+                        ),
+                        color = MaterialTheme.colorScheme.surfaceContainerLow,
+                        border = BorderStroke(
+                            width = 1.dp,
+                            color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)
+                        ),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(12.dp)
+                        ) {
+                            CrossfadeCurvePreview(
+                                type = localType,
+                                isSelected = true,
+                                widthDp = 120,
+                                heightDp = 64,
+                            )
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = localType.displayName(),
+                                    style = MaterialTheme.typography.titleMedium.copy(
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = MaterialTheme.colorScheme.primary
+                                    )
+                                )
+                                Spacer(Modifier.height(2.dp))
+                                Text(
+                                    text = localType.description(),
+                                    style = MaterialTheme.typography.bodySmall.copy(
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        lineHeight = 14.sp
+                                    )
+                                )
+                            }
+                        }
+                    }
                 }
             }
         )
@@ -681,11 +1090,21 @@ fun CrossfadeSliderPreference(
                 Text(stringResource(R.string.audio_crossfade_title))
                 if (isCrossfadeEnabled) {
                     Badge(
-                        text = "${displayValue}s",
+                        text = "${displayValue}s · ${localType.displayName()}",
                         color = MaterialTheme.colorScheme.primary
                     )
                 }
             }
+        },
+        subtitle = {
+            if (isCrossfadeEnabled) {
+                CrossfadeCurvePreview(
+                    type = localType,
+                    isSelected = true,
+                    widthDp = 200,
+                    heightDp = 42,
+                )
+            } else null
         },
         description = descriptionText,
         icon = {

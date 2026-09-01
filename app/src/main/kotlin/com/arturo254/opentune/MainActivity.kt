@@ -10,6 +10,7 @@ package com.arturo254.opentune
 
 import android.annotation.SuppressLint
 import android.Manifest
+import android.app.SearchManager
 import android.content.ComponentName
 import android.content.Intent
 import android.content.ServiceConnection
@@ -17,6 +18,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
+import android.provider.MediaStore
 import android.view.View
 import android.view.WindowManager
 import androidx.activity.ComponentActivity
@@ -449,11 +451,47 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (intent.action == MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH ||
+            intent.action == "android.media.action.MEDIA_PLAY_FROM_SEARCH" ||
+            intent.action == Intent.ACTION_SEARCH
+        ) {
+            forwardVoiceSearchToMusicService(intent)
+            return
+        }
         if (::navController.isInitialized) {
             handleDeepLinkIntent(intent, navController)
         } else {
             pendingIntent = intent
         }
+    }
+
+    private fun forwardVoiceSearchToMusicService(intent: Intent) {
+        val forward = Intent(this, MusicService::class.java).apply {
+            action = intent.action ?: MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH
+            if (intent.extras != null) {
+                putExtras(intent.extras!!)
+            }
+            intent.getStringExtra(SearchManager.QUERY)?.let {
+                putExtra(SearchManager.QUERY, it)
+            }
+            // Re-copy structured BII extras por si algún asistente no los pone en extras
+            // pero sí como claves directas en el intent.
+            intent.getStringExtra("query")?.let { putExtra("query", it) }
+            intent.getStringExtra("artist")?.let { putExtra("artist", it) }
+            intent.getStringExtra("album")?.let { putExtra("album", it) }
+            intent.getStringExtra("playlist")?.let { putExtra("playlist", it) }
+            intent.getStringExtra("genre")?.let { putExtra("genre", it) }
+            intent.getStringExtra("focus")?.let { putExtra("focus", it) }
+            intent.getStringExtra(Intent.EXTRA_TITLE)?.let { putExtra(Intent.EXTRA_TITLE, it) }
+        }
+        startMusicServiceSafely()
+        runCatching {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(forward)
+            } else {
+                startService(forward)
+            }
+        }.onFailure { reportException(it) }
     }
 
 
@@ -1151,11 +1189,18 @@ class MainActivity : ComponentActivity() {
                     }
 
                     LaunchedEffect(Unit) {
-                        if (pendingIntent != null) {
+                        val launchIntent = intent
+                        val action = launchIntent.action
+                        if (action == MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH ||
+                            action == "android.media.action.MEDIA_PLAY_FROM_SEARCH" ||
+                            action == Intent.ACTION_SEARCH
+                        ) {
+                            forwardVoiceSearchToMusicService(launchIntent)
+                        } else if (pendingIntent != null) {
                             handleDeepLinkIntent(pendingIntent!!, navController)
                             pendingIntent = null
                         } else {
-                            handleDeepLinkIntent(intent, navController)
+                            handleDeepLinkIntent(launchIntent, navController)
                         }
                     }
 

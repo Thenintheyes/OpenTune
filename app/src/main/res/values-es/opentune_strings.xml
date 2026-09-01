@@ -309,6 +309,8 @@
     <string name="crossfade_tip">Valores más altos funcionan mejor en música electrónica o ambiental</string>
     <string name="preview_crossfade">Vista previa</string>
     <string name="crossfade_duration_seconds">%d segundos</string>
+    <string name="crossfade_transition_style">Curvas de transición</string>
+    <string name="crossfade_transition_style_subtitle">Elige cómo entran y salen las canciones</string>
 
 
     <string name="confirm">Confirmar</string>

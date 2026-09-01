@@ -136,6 +136,58 @@ val SkipSilenceKey = booleanPreferencesKey("skipSilence")
 val AudioNormalizationKey = booleanPreferencesKey("audioNormalization")
 val AudioOffload = booleanPreferencesKey("audioOffload")
 val AudioCrossfadeDurationKey = intPreferencesKey("audioCrossfadeDuration")
+val AudioCrossfadeTypeKey = stringPreferencesKey("audioCrossfadeType")
+val AudioCrossfadeGaplessKey = booleanPreferencesKey("audio_crossfade_gapless")
+
+enum class CrossfadeType {
+    EQUAL_POWER,
+    LINEAR,
+    LOGARITHMIC,
+    EXPONENTIAL,
+    SMOOTHSTEP,
+    SMOOTHERSTEP,
+    CONSTANT_GAIN,
+    FAST_START,
+    SLOW_START,
+    WAVE_MIX,
+    TRIANGLE,
+    DIPPED;
+
+    companion object {
+        val DEFAULT = EQUAL_POWER
+    }
+}
+
+fun CrossfadeType.displayName(): String = when (this) {
+    CrossfadeType.EQUAL_POWER -> "Equal Power"
+    CrossfadeType.LINEAR -> "Lineal"
+    CrossfadeType.LOGARITHMIC -> "Logarítmico"
+    CrossfadeType.EXPONENTIAL -> "Exponencial"
+    CrossfadeType.SMOOTHSTEP -> "Smoothstep"
+    CrossfadeType.SMOOTHERSTEP -> "Smootherstep"
+    CrossfadeType.CONSTANT_GAIN -> "Ganancia constante"
+    CrossfadeType.FAST_START -> "Inicio rápido"
+    CrossfadeType.SLOW_START -> "Inicio lento"
+    CrossfadeType.WAVE_MIX -> "Mezcla wave"
+    CrossfadeType.TRIANGLE -> "Triangular"
+    CrossfadeType.DIPPED -> "Dipped (sumergido)"
+}
+
+fun CrossfadeType.description(): String = when (this) {
+    CrossfadeType.EQUAL_POWER -> "Sin/cos — sin salto de volumen en el centro (recomendado)"
+    CrossfadeType.LINEAR -> "Fundido directo 0↔1 — mejor para transiciones cortas"
+    CrossfadeType.LOGARITHMIC -> "Curva logarítmica — entrada suave, salida rápida"
+    CrossfadeType.EXPONENTIAL -> "Curva exponencial — entrada rápida, salida suave"
+    CrossfadeType.SMOOTHSTEP -> "Aceleración suave en los extremos (step3)"
+    CrossfadeType.SMOOTHERSTEP -> "Aceleración más suave (step5) — sin rugosidad"
+    CrossfadeType.CONSTANT_GAIN -> "Suma lineal de volúmenes — efecto DJ simple"
+    CrossfadeType.FAST_START -> "La canción que entra suena desde el principio"
+    CrossfadeType.SLOW_START -> "La canción que entra aparece muy gradualmente"
+    CrossfadeType.WAVE_MIX -> "Mezcla mediante ondas senoidales desplazadas"
+    CrossfadeType.TRIANGLE -> "Picos lineales — ideal para géneros electrónicos"
+    CrossfadeType.DIPPED -> "Hundimiento de volumen en medio — enfatiza el cambio"
+}
+
 val AutoLoadMoreKey = booleanPreferencesKey("autoLoadMore")
 val AutoDownloadOnLikeKey = booleanPreferencesKey("autoDownloadOnLike")
 val AutoSkipNextOnErrorKey = booleanPreferencesKey("autoSkipNextOnError")
@@ -236,7 +288,6 @@ val MixSortDescendingKey = booleanPreferencesKey("albumSortDescending")
 val SongFilterKey = stringPreferencesKey("songFilter")
 val ArtistFilterKey = stringPreferencesKey("artistFilter")
 val AlbumFilterKey = stringPreferencesKey("albumFilter")
-val AudioCrossfadeGaplessKey = booleanPreferencesKey("audio_crossfade_gapless")
 
 val ArtistViewTypeKey = stringPreferencesKey("artistViewType")
 val AlbumViewTypeKey = stringPreferencesKey("albumViewType")

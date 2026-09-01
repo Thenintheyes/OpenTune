@@ -10,12 +10,14 @@ package com.arturo254.opentune.playback
 
 import android.content.ContentResolver
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import androidx.annotation.DrawableRes
 import androidx.core.net.toUri
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.offline.Download
 import androidx.media3.session.LibraryResult
 import androidx.media3.session.MediaLibraryService
@@ -160,7 +162,19 @@ constructor(
         query: String,
         params: MediaLibraryService.LibraryParams?,
     ): ListenableFuture<LibraryResult<Void>> =
-        Futures.immediateFuture(LibraryResult.ofVoid(params))
+        scope.future {
+            val q = query.trim()
+            if (q.isBlank()) {
+                return@future LibraryResult.ofVoid(params)
+            }
+            // En caso de que el assistant / Android Auto nos dé una búsqueda estructurada
+            // (requestMetadata.searchQuery no rellenado pero onSearch sí llamado),
+            // ejecutamos onGetSearchResult internamente para notificar a suscriptores.
+            // La reproducción real de la búsqueda de voz viene por onSetMediaItems
+            // (requestMetadata.searchQuery) o por MEDIA_PLAY_FROM_SEARCH directo al
+            // MusicService.onStartCommand.
+            LibraryResult.ofVoid(params)
+        }
 
     override fun onGetSearchResult(
         session: MediaLibrarySession,
@@ -641,11 +655,56 @@ constructor(
         startPositionMs: Long,
     ): ListenableFuture<MediaSession.MediaItemsWithStartPosition> =
         scope.future {
-            // Play from Android Auto
+            // Play from Android Auto / Assistant: parsing de extras estructurados
             val defaultResult =
                 MediaSession.MediaItemsWithStartPosition(emptyList(), startIndex, startPositionMs)
             val firstItem = mediaItems.firstOrNull() ?: return@future defaultResult
             val path = firstItem.mediaId.split("/").filter { it.isNotBlank() }
+
+            // Parse extras estructurados BII / Assistant / MediaDescription
+            val requestMetadata = firstItem.requestMetadata
+            val extras = firstItem.mediaMetadata.extras ?: Bundle.EMPTY
+            val rmExtras = requestMetadata.extras ?: Bundle.EMPTY
+
+            val bArtist = extras.getString("artist")
+                ?: rmExtras.getString("artist")
+                ?: rmExtras.getString(Intent.EXTRA_TITLE)
+                ?: firstItem.mediaMetadata.artist?.toString()
+            val bAlbum = extras.getString("album")
+                ?: rmExtras.getString("album")
+                ?: firstItem.mediaMetadata.albumTitle?.toString()
+            val bPlaylist = extras.getString("playlist")
+                ?: rmExtras.getString("playlist")
+            val bGenre = extras.getString("genre")
+                ?: rmExtras.getString("genre")
+            val bFocus = extras.getString("focus")
+                ?: rmExtras.getString("focus")
+                ?: rmExtras.getString("android.intent.extra.MEDIA_FOCUS")
+            val explicitSearchQuery =
+                requestMetadata.searchQuery?.trim().orEmpty().ifBlank {
+                    firstItem.mediaMetadata.title?.toString()?.trim().orEmpty()
+                }
+
+            val searchFromExtras = buildString {
+                append(explicitSearchQuery)
+                if (!bArtist.isNullOrBlank()) {
+                    if (isNotEmpty()) append(' ')
+                    append(bArtist)
+                }
+                if (!bAlbum.isNullOrBlank()) {
+                    if (isNotEmpty()) append(' ')
+                    append(bAlbum)
+                }
+                if (!bPlaylist.isNullOrBlank()) {
+                    if (isNotEmpty()) append(' ')
+                    append(bPlaylist)
+                }
+                if (!bGenre.isNullOrBlank()) {
+                    if (isNotEmpty()) append(' ')
+                    append(bGenre)
+                }
+            }.trim()
+
             when (path.firstOrNull()) {
                 MusicService.SONG -> {
                     val songId = path.getOrNull(1) ?: return@future defaultResult
@@ -732,15 +791,38 @@ constructor(
                 }
 
                 else -> {
-                    val query = firstItem.requestMetadata.searchQuery?.trim().orEmpty()
+                    // BII / Assistant: onPlayFromSearch / custom setMediaItems con searchQuery
+                    val query = searchFromExtras.ifBlank {
+                        explicitSearchQuery
+                    }
                     if (query.isBlank()) return@future defaultResult
 
                     val matchedSongs = database.searchSongs(query, previewSize = 50).first()
-                    val songId = matchedSongs.firstOrNull()?.id ?: return@future defaultResult
+                    val firstSong = matchedSongs.firstOrNull() ?: run {
+                        // Fallback online: si la búsqueda local no da nada, pero tenemos
+                        // request metadata, devolvemos un MediaItem "placeholder" para que
+                        // el ResolvingDataSource del Main / MediaSource lo resuelva online.
+                        val fallbackMediaItem = firstItem.buildUpon()
+                            .setMediaId("VOICE_SEARCH:$query")
+                            .setRequestMetadata(
+                                androidx.media3.common.MediaItem.RequestMetadata.Builder()
+                                    .setSearchQuery(query)
+                                    .setExtras(rmExtras)
+                                    .build()
+                            )                            .build()
+                        val items = listOf(fallbackMediaItem)
+                        val queue = (mediaSession.player.applicationLooper ?: return@future defaultResult)
+                        val serviceContext = mediaSession.player as? ExoPlayer
+                        return@future MediaSession.MediaItemsWithStartPosition(
+                            items,
+                            0,
+                            startPositionMs,
+                        )
+                    }
                     val allSongs = database.songsByCreateDateAsc().first()
                     MediaSession.MediaItemsWithStartPosition(
                         allSongs.map { it.toMediaItem() },
-                        allSongs.indexOfFirst { it.id == songId }.takeIf { it != -1 } ?: 0,
+                        allSongs.indexOfFirst { it.id == firstSong.id }.takeIf { it != -1 } ?: 0,
                         startPositionMs,
                     )
                 }

@@ -151,9 +151,35 @@
                 <data android:mimeType="audio/*" />
             </intent-filter>
 
+            <!--
+              Voice search (OK Google / Assistant / Gemini)
+              El MEDIA_PLAY_FROM_SEARCH del asistente DEBE tener su propio intent-filter SIN
+              <data> de esquema/host, porque Google Assistant envía:
+                  act=android.media.action.MEDIA_PLAY_FROM_SEARCH
+                  extras: query, artist, album, playlist, genre, focus, etc.
+                  (sin data URI)
+              Si se mezcla con <data> (http://youtube.com etc.), el PackageManager NO MATCHEA
+              y la app no aparece en el picker "completar acción".
+            -->
+            <intent-filter>
+                <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+
+            <intent-filter>
+                <action android:name="android.intent.action.SEARCH" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+
             <meta-data
                 android:name="android.app.shortcuts"
                 android:resource="@xml/shortcuts" />
+            <meta-data
+                android:name="android.app.actions"
+                android:resource="@xml/shortcuts" />
+            <meta-data
+                android:name="android.app.searchable"
+                android:resource="@xml/searchable" />
         </activity>
 
         <provider
@@ -175,6 +201,7 @@
                 <action android:name="androidx.media3.session.MediaSessionService" />
                 <action android:name="androidx.media3.session.MediaLibraryService" />
                 <action android:name="android.media.browse.MediaBrowserService" />
+                <action android:name="android.media.action.MEDIA_PLAY_FROM_SEARCH" />
                 <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </service>

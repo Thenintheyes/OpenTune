@@ -357,6 +357,8 @@
     <string name="crossfade_tip">Higher values ​​work best in electronic or ambient music</string>
     <string name="preview_crossfade">Preview</string>
     <string name="crossfade_duration_seconds">%d seconds</string>
+    <string name="crossfade_transition_style">Transition curves</string>
+    <string name="crossfade_transition_style_subtitle">Choose how songs fade in and out</string>
 
 
     <string name="confirm">Confirm</string>

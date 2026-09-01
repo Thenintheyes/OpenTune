@@ -12,6 +12,7 @@ package com.arturo254.opentune.playback
 
 import android.app.PendingIntent
 import android.app.ActivityManager
+import android.app.SearchManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -33,6 +34,7 @@ import android.net.ConnectivityManager
 import android.net.Uri
 import android.os.Binder
 import android.os.PowerManager
+import android.provider.MediaStore
 import android.widget.Toast
 import androidx.core.content.getSystemService
 import androidx.core.net.toUri
@@ -91,7 +93,9 @@ import com.arturo254.opentune.R
 import com.arturo254.opentune.constants.AudioNormalizationKey
 import com.arturo254.opentune.constants.AudioOffload
 import com.arturo254.opentune.constants.AudioCrossfadeDurationKey
+import com.arturo254.opentune.constants.AudioCrossfadeTypeKey
 import com.arturo254.opentune.constants.AudioQualityKey
+import com.arturo254.opentune.constants.CrossfadeType
 import com.arturo254.opentune.constants.AutoLoadMoreKey
 import com.arturo254.opentune.constants.AutoDownloadOnLikeKey
 import com.arturo254.opentune.constants.AutoSkipNextOnErrorKey
@@ -161,6 +165,7 @@ import com.arturo254.opentune.models.PersistQueue
 import com.arturo254.opentune.models.PersistPlayerState
 import com.arturo254.opentune.models.toMediaMetadata
 import com.arturo254.opentune.playback.queues.EmptyQueue
+import com.arturo254.opentune.playback.queues.ListQueue
 import com.arturo254.opentune.playback.queues.Queue
 import com.arturo254.opentune.playback.queues.YouTubeQueue
 import com.arturo254.opentune.playback.queues.filterExplicit
@@ -238,8 +243,10 @@ import android.app.NotificationManager
 import android.app.Notification
 import android.os.Build
 import android.content.pm.ServiceInfo
+import android.os.Bundle
 import androidx.core.app.NotificationCompat
 import com.arturo254.opentune.constants.JossRedMultimediaKey
+import kotlin.math.absoluteValue
 
 @OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
 @AndroidEntryPoint
@@ -358,11 +365,20 @@ class MusicService :
         }.flowOn(Dispatchers.IO)
 
     private val normalizeFactor = MutableStateFlow(1f)
+    private val normalizeFactorOverride = MutableStateFlow<Float?>(null)
+    private var normalizeRampJob: Job? = null
+    private var lastAppliedFormatLoudnessNormalize: Float = 1f
+    private var skipSilenceUserPreference: Boolean = false
+    private var skipSilenceRuntimeOverrideActive: Boolean = false
+    private var crossfadeOrHandoffInFlightForNormalize: Boolean = false
     var playerVolume = MutableStateFlow(1f)
     private val audioFocusVolumeFactor = MutableStateFlow(1f)
     private val playbackFadeFactor = MutableStateFlow(1f)
     private val crossfadeDurationMs = MutableStateFlow(0)
+    private val crossfadeType = MutableStateFlow(CrossfadeType.DEFAULT)
     private val audioNormalizationEnabled = MutableStateFlow(true)
+    private val mainCrossfadeProcessor = CrossfadeAudioProcessor()
+    private val overlapCrossfadeProcessor = CrossfadeAudioProcessor()
     private var crossfadeAudio: CrossfadeAudio? = null
     private var lyricsPreloadManager: LyricsPreloadManager? = null
 
@@ -736,8 +752,9 @@ class MusicService :
             }
         }
 
-        combine(playerVolume, normalizeFactor, audioFocusVolumeFactor, playbackFadeFactor) { playerVolume, normalizeFactor, audioFocusVolumeFactor, playbackFadeFactor ->
-            playerVolume * normalizeFactor * audioFocusVolumeFactor * playbackFadeFactor
+        combine(playerVolume, normalizeFactor, normalizeFactorOverride, audioFocusVolumeFactor, playbackFadeFactor) { playerVolume, normalizeFactor, normalizeFactorOverride, audioFocusVolumeFactor, playbackFadeFactor ->
+            val effectiveNormalize = normalizeFactorOverride ?: normalizeFactor
+            playerVolume * effectiveNormalize * audioFocusVolumeFactor * playbackFadeFactor
         }.collectLatest(scope) { finalVolume ->
             player.volume = finalVolume
         }
@@ -781,8 +798,9 @@ class MusicService :
         dataStore.data
             .map { it[SkipSilenceKey] ?: false }
             .distinctUntilChanged()
-            .collectLatest(scope) {
-                player.skipSilenceEnabled = it
+            .collectLatest(scope) { persisted ->
+                skipSilenceUserPreference = persisted
+                applySkipSilenceWithCrossfadeOverride()
             }
 
         dataStore.data
@@ -830,8 +848,23 @@ class MusicService :
         dataStore.data
             .map { (it[AudioCrossfadeDurationKey] ?: 0) * 1000 }
             .distinctUntilChanged()
-            .collectLatest(scope) {
-                crossfadeDurationMs.value = it
+            .collectLatest(scope) { durationMs ->
+                crossfadeDurationMs.value = durationMs
+                mainCrossfadeProcessor.crossfadeDurationMs = durationMs
+                overlapCrossfadeProcessor.crossfadeDurationMs = durationMs
+                skipSilenceRuntimeOverrideActive = durationMs > 0
+                applySkipSilenceWithCrossfadeOverride()
+            }
+
+        dataStore.data
+            .map { (it[AudioCrossfadeTypeKey] ?: CrossfadeType.DEFAULT.name) }
+            .distinctUntilChanged()
+            .collectLatest(scope) { name ->
+                val type = runCatching { CrossfadeType.valueOf(name) }
+                    .getOrDefault(CrossfadeType.DEFAULT)
+                crossfadeType.value = type
+                mainCrossfadeProcessor.crossfadeType = type
+                overlapCrossfadeProcessor.crossfadeType = type
             }
 
         dataStore.data
@@ -847,16 +880,20 @@ class MusicService :
                 player = player,
                 database = database,
                 crossfadeDurationMs = crossfadeDurationMs,
+                crossfadeType = crossfadeType,
                 playbackFadeFactor = playbackFadeFactor,
                 playerVolume = playerVolume,
                 audioFocusVolumeFactor = audioFocusVolumeFactor,
                 audioNormalizationEnabled = audioNormalizationEnabled,
                 maxSafeGainFactor = maxSafeGainFactor,
+                sharedNormalizeFactor = normalizeFactor,
+                mainCrossfadeProcessor = mainCrossfadeProcessor,
+                overlapCrossfadeProcessor = overlapCrossfadeProcessor,
                 overlapPlayerFactory = {
                     ExoPlayer
                         .Builder(this)
                         .setMediaSourceFactory(createMediaSourceFactory())
-                        .setRenderersFactory(createRenderersFactory())
+                        .setRenderersFactory(createRenderersFactory(overlapCrossfadeProcessor))
                         .setHandleAudioBecomingNoisy(false)
                         .setWakeMode(C.WAKE_MODE_NETWORK)
                         .setAudioAttributes(
@@ -869,8 +906,18 @@ class MusicService :
                         ).setSeekBackIncrementMs(5000)
                         .setSeekForwardIncrementMs(5000)
                         .build()
+                        .also {
+                            it.skipSilenceEnabled = false
+                        }
+                },
+                onHandoffNormalizeSnap = { targetFactor, rampMs ->
+                    snapNormalizeFactorForHandoff(targetFactor, rampMs)
+                },
+                streamFadesBypassController = { bypassed, nextStartOnly ->
+                    setStreamFadesBypassedSmart(bypassed, nextStartOnly)
                 },
                 onCrossfadeStart = { mediaItem ->
+                    crossfadeOrHandoffInFlightForNormalize = true
                     val metadata = mediaItem.metadata
                     currentMediaMetadata.value = metadata
                     // immediate update when media item transitions to avoid stale presence
@@ -895,6 +942,22 @@ class MusicService :
                         } catch (e: Exception) {
                             e.printStackTrace()
                         }
+                    }
+                },
+                onCrossfadeAndHandoffAllFinished = {
+                    // Todos los procesos de crossfade han terminado: overlap drenado, handoff finalizado,
+                    // solo el main player está reproduciendo. Ahora sí es seguro lanzar la rampa de
+                    // normalización desde el snap que congelamos en beginHandoffFromOverlap hasta el
+                    // último valor de lastAppliedFormatLoudnessNormalize (que para entonces ya habrá
+                    // llegado el collector de currentFormat, incluso en decodificadores lentos).
+                    crossfadeOrHandoffInFlightForNormalize = false
+                    val finalTarget = lastAppliedFormatLoudnessNormalize.coerceIn(0.2f, maxSafeGainFactor)
+                    if (normalizeFactorOverride.value != null) {
+                        scheduleNormalizeRampFromOverride(
+                            target = finalTarget,
+                            rampMs = 420,
+                            delayMs = 0
+                        )
                     }
                 }
             ).also { it.start(scope) }
@@ -925,23 +988,18 @@ class MusicService :
             audioNormalizationEnabled.value = normalizeAudio
             Timber.tag("AudioNormalization").d("Audio normalization enabled: $normalizeAudio")
             Timber.tag("AudioNormalization").d("Format loudnessDb: ${format?.loudnessDb}, perceptualLoudnessDb: ${format?.perceptualLoudnessDb}")
-            
-            normalizeFactor.value =
+
+            val targetFactor =
                 if (normalizeAudio) {
-                    // Use loudnessDb if available, otherwise fall back to perceptualLoudnessDb
                     val loudness = format?.loudnessDb ?: format?.perceptualLoudnessDb
-                    
                     if (loudness != null) {
                         val loudnessDb = loudness.toFloat()
                         var factor = 10f.pow(-loudnessDb / 20)
-                        
                         Timber.tag("AudioNormalization").d("Calculated raw normalization factor: $factor (from loudness: $loudnessDb)")
-                        
                         if (factor > 1f) {
                             factor = min(factor, maxSafeGainFactor)
                             Timber.tag("AudioNormalization").d("Factor capped at maxSafeGainFactor: $factor")
                         }
-                        
                         Timber.tag("AudioNormalization").i("Applying normalization factor: $factor")
                         factor
                     } else {
@@ -952,6 +1010,19 @@ class MusicService :
                     Timber.tag("AudioNormalization").d("Normalization disabled - using factor 1.0")
                     1f
                 }
+            lastAppliedFormatLoudnessNormalize = targetFactor.coerceIn(0.2f, maxSafeGainFactor)
+            normalizeFactor.value = lastAppliedFormatLoudnessNormalize
+            val overrideActive = normalizeFactorOverride.value != null
+            if (overrideActive && !crossfadeOrHandoffInFlightForNormalize) {
+                // Caso normal (sin crossfade/handoff en curso): rampa suave hacia el loudness nuevo.
+                scheduleNormalizeRampFromOverride(target = lastAppliedFormatLoudnessNormalize, rampMs = 280, delayMs = 80)
+            } else if (overrideActive && crossfadeOrHandoffInFlightForNormalize) {
+                // Caso crossfade/handoff en curso: NO lanzamos rampa para evitar carreras.
+                // El valor correcto ya está "congelado" en normalizeFactorOverride (snap del overlap).
+                // Cuando finalice todo el ciclo crossfade→handoff→drain, onCrossfadeAndHandoffAllFinished
+                // lanzará la rampa hacia el último lastApplied, con lo que el cambio de loudness
+                // se escuchará solo cuando la nueva canción ya sea la única reproduciendo.
+            }
         }
 
         dataStore.data
@@ -4659,7 +4730,99 @@ class MusicService :
         }
     }
 
-    private fun createRenderersFactory() =
+    /**
+     * Aplica el `player.skipSilenceEnabled` combinando la preferencia persistida
+     * del usuario ([skipSilenceUserPreference]) con el override runtime de crossfade
+     * ([skipSilenceRuntimeOverrideActive]). Cuando el crossfade está activado,
+     * deshabilitamos el skip-silence temporalmente para evitar discontinuidad en
+     * la pipeline de DSP (el crossfade necesita timing exacto del tail/head de cada
+     * stream y el skip-silence acorta esos márgenes provocando spikes de volumen
+     * y clicks). La preferencia del usuario NO se modifica en el DataStore.
+     */
+    private fun applySkipSilenceWithCrossfadeOverride() {
+        val effectiveSkipSilence = skipSilenceUserPreference && !skipSilenceRuntimeOverrideActive
+        runCatching {
+            player.skipSilenceEnabled = effectiveSkipSilence
+        }
+    }
+
+    // ── Normalize ramp controller (handoff smooth snap → fade) ──────────────────
+
+    /**
+     * Llamado por [CrossfadeAudio] cuando empieza el handoff overlap→main.
+     * Congela el factor de normalización en [overlapSnapFactor] (el que usaba
+     * el overlap player, calculado desde la nueva canción) y agenda una rampa
+     * suave hacia el [lastAppliedFormatLoudnessNormalize] final para evitar
+     * picos de volumen cuando el main player recibe asíncronamente el
+     * `currentFormat` del nuevo tema.
+     */
+    private fun snapNormalizeFactorForHandoff(overlapSnapFactor: Float, rampMs: Int) {
+        crossfadeOrHandoffInFlightForNormalize = true
+        normalizeRampJob?.cancel()
+        normalizeRampJob = null
+        // Freeze: no lanzamos rampa inicial. El normalize queda congelado en el snap del overlap
+        // (factor correcto de la canción nueva) hasta que finalice todo el crossfade + handoff + drain.
+        // Así evitamos carreras con el collector de currentFormat, que suele llegar 50-600 ms después
+        // con un loudness distinto. La rampa se lanzará DESPUÉS desde onCrossfadeAndHandoffAllFinished.
+        normalizeFactorOverride.value = overlapSnapFactor.coerceIn(0.2f, maxSafeGainFactor)
+    }
+
+    /**
+     * Rampa smoothstep `normalizeFactorOverride` desde su valor actual hacia
+     * [target] durante [rampMs] ms. Tras finalizar, libera el override para
+     * que el combine vuelva a usar `normalizeFactor.value` normal.
+     */
+    private fun scheduleNormalizeRampFromOverride(target: Float, rampMs: Int, delayMs: Int) {
+        normalizeRampJob?.cancel()
+        normalizeRampJob = scope.launch {
+            if (delayMs > 0) delay(delayMs.toLong())
+            val startFactor = normalizeFactorOverride.value ?: normalizeFactor.value
+            val clampedTarget = target.coerceIn(0.2f, maxSafeGainFactor)
+            val clampedStart = startFactor.coerceIn(0.2f, maxSafeGainFactor)
+            if ((clampedTarget - clampedStart).absoluteValue < 0.005f) {
+                normalizeFactorOverride.value = null
+                normalizeRampJob = null
+                return@launch
+            }
+            val durationMs = rampMs.coerceAtLeast(40).toLong()
+            val stepMs = 12L
+            val steps = (durationMs / stepMs).coerceAtLeast(2)
+            var step = 0
+            while (step <= steps && kotlin.coroutines.coroutineContext.isActive) {
+                val linearT = step.toFloat() / steps.toFloat()
+                val smoothT = linearT * linearT * (3f - 2f * linearT)
+                val value = clampedStart + smoothT * (clampedTarget - clampedStart)
+                normalizeFactorOverride.value = value.coerceIn(0.2f, maxSafeGainFactor)
+                step++
+                if (step <= steps) delay(stepMs)
+            }
+            normalizeFactorOverride.value = null
+            normalizeRampJob = null
+        }
+    }
+
+    /**
+     * Controla `streamFadesBypassed` de los dos processors evitando toggles
+     * que introducen discontinuidades justo en el seek-to-handoff.
+     * Si [applyNextStartOnly] es true, marca `framesOutputInStream` de los
+     * processors como "ya pasados del fade-in" para que el próximo stream
+     * (la nueva canción en el main) no reciba un fade-in PCM espurio tras
+     * finalizar el handoff.
+     */
+    private fun setStreamFadesBypassedSmart(bypassed: Boolean, applyNextStartOnly: Boolean) {
+        runCatching {
+            if (applyNextStartOnly) {
+                mainCrossfadeProcessor.skipNextFadeIn()
+                overlapCrossfadeProcessor.skipNextFadeIn()
+            }
+            mainCrossfadeProcessor.streamFadesBypassed = bypassed
+            overlapCrossfadeProcessor.streamFadesBypassed = bypassed
+        }
+    }
+
+    private fun createRenderersFactory(
+        overrideCrossfadeProcessor: CrossfadeAudioProcessor? = null,
+    ) =
         object : DefaultRenderersFactory(this) {
             override fun buildAudioSink(
                 context: Context,
@@ -4671,14 +4834,8 @@ class MusicService :
                 .setEnableAudioTrackPlaybackParams(enableAudioTrackPlaybackParams)
                 .setAudioProcessorChain(
                     DefaultAudioSink.DefaultAudioProcessorChain(
-                        SilenceSkippingAudioProcessor(
-                            1_500_000L,
-                            0.35f,
-                            500_000L,
-                            10,
-                            150.toShort(),
-                        ),
                         SonicAudioProcessor(),
+                        overrideCrossfadeProcessor ?: mainCrossfadeProcessor,
                     ),
                 ).build()
         }
@@ -5169,8 +5326,127 @@ class MusicService :
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         handlePlayerWidgetAction(intent?.action)
+        if (intent?.action == MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH ||
+            intent?.action == "android.media.action.MEDIA_PLAY_FROM_SEARCH"
+        ) {
+            handleVoicePlayFromSearch(intent = intent)
+        }
         super.onStartCommand(intent, flags, startId)
         return START_NOT_STICKY
+    }
+
+    private fun handleVoicePlayFromSearch(intent: Intent) {
+        val extras = intent.extras ?: Bundle.EMPTY
+        val rawQuery = intent.getStringExtra(SearchManager.QUERY)
+            ?: extras.getString("query")
+            ?: extras.getString(Intent.EXTRA_TITLE)
+            ?: extras.getString("android.intent.extra.TITLE")
+            ?: extras.getString("title")
+            ?: extras.getString("text")
+        val artist = extras.getString("artist")
+        val album = extras.getString("album")
+        val playlist = extras.getString("playlist")
+        val genre = extras.getString("genre")
+        val focus = extras.getString("focus")
+            ?: extras.getString("android.intent.extra.MEDIA_FOCUS")
+        val structuredQuery = buildString {
+            if (!rawQuery.isNullOrBlank()) append(rawQuery.trim())
+            if (!artist.isNullOrBlank()) append(" $artist")
+            if (!album.isNullOrBlank()) append(" $album")
+            if (!playlist.isNullOrBlank()) append(" $playlist")
+            if (!genre.isNullOrBlank()) append(" $genre")
+        }.trim()
+
+        if (structuredQuery.isBlank()) return
+
+        scope.launch(SilentHandler) {
+            runCatching {
+                searchAndPlayQuery(
+                    query = structuredQuery,
+                    focus = focus,
+                    rawExtras = extras,
+                )
+            }.onFailure { reportException(it) }
+        }
+    }
+
+    private suspend fun searchAndPlayQuery(
+        query: String,
+        focus: String? = null,
+        rawExtras: Bundle? = null,
+    ) {
+        val filter = when {
+            !focus.isNullOrBlank() -> {
+                val lc = focus.lowercase()
+                when {
+                    lc.contains("playlist") -> YouTube.SearchFilter.FILTER_FEATURED_PLAYLIST
+                    lc.contains("album") -> YouTube.SearchFilter.FILTER_ALBUM
+                    lc.contains("artist") || lc.contains("singer") -> YouTube.SearchFilter.FILTER_ARTIST
+                    else -> YouTube.SearchFilter.FILTER_SONG
+                }
+            }
+            else -> YouTube.SearchFilter.FILTER_SONG
+        }
+
+        val onlineFirst =
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    YouTube.search(query, filter).getOrThrow().items
+                }
+            }.getOrDefault(emptyList())
+
+        val songsOnline =
+            onlineFirst
+                .filterIsInstance<SongItem>()
+                .take(50)
+
+        if (songsOnline.isNotEmpty()) {
+            val toPlay = songsOnline.first()
+            val endpoint = toPlay.endpoint ?: WatchEndpoint(videoId = toPlay.id)
+            playQueue(YouTubeQueue(endpoint = endpoint, preloadItem = toPlay.toMediaMetadata()))
+            return
+        }
+
+        val albumsOnline = onlineFirst.filterIsInstance<com.arturo254.opentune.innertube.models.AlbumItem>()
+        if (albumsOnline.isNotEmpty() && (filter == YouTube.SearchFilter.FILTER_ALBUM || songsOnline.isEmpty())) {
+            val firstAlbum = albumsOnline.first()
+            val songs = withContext(Dispatchers.IO) {
+                runCatching { YouTube.albumSongs(firstAlbum.playlistId).getOrThrow() }
+                    .getOrDefault(emptyList())
+            }
+            if (songs.isNotEmpty()) {
+                val queueItems = songs.map { it.toMediaItem() }
+                playQueue(ListQueue(title = firstAlbum.title, items = queueItems, startIndex = 0))
+                return
+            }
+        }
+
+        val artistsOnline = onlineFirst.filterIsInstance<com.arturo254.opentune.innertube.models.ArtistItem>()
+        if (artistsOnline.isNotEmpty() && filter == YouTube.SearchFilter.FILTER_ARTIST) {
+            val firstArtist = artistsOnline.first()
+            val radioEndpoint = firstArtist.radioEndpoint
+                ?: firstArtist.playEndpoint
+            if (radioEndpoint != null) {
+                playQueue(YouTubeQueue(endpoint = radioEndpoint, preloadItem = null))
+                return
+            }
+        }
+
+        // Fallback local: Room database search
+        val matchedSongs =
+            runCatching {
+                database.searchSongs(query, previewSize = 100).first()
+            }.getOrDefault(emptyList())
+
+        if (matchedSongs.isNotEmpty()) {
+            val firstSong = matchedSongs.first()
+            val allSongs = runCatching { database.songsByCreateDateAsc().first() }
+                .getOrDefault(matchedSongs)
+            val queueItems = allSongs.map { it.toMediaItem() }
+            val startIndex = allSongs.indexOfFirst { it.id == firstSong.id }.takeIf { it != -1 } ?: 0
+            playQueue(ListQueue(title = query, items = queueItems, startIndex = startIndex))
+            return
+        }
     }
 
     private fun handlePlayerWidgetAction(action: String?) {
